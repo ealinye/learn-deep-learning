@@ -1,0 +1,10 @@
+[package]
+name = "learn-deep-learning"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+burn = { version = "0.11.1", features = ["tui", "wgpu", "fusion", "train"] }
+
