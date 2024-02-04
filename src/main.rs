@@ -1,97 +1,32 @@
-use burn::backend::autodiff::grads::Gradients;
 use burn::backend::{wgpu::WgpuDevice, Autodiff, Fusion, Wgpu};
+use burn::config::Config;
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataset::vision::{MNISTDataset, MNISTItem};
-use burn::data::dataset::Dataset;
-use burn::tensor::{Data, Distribution, ElementConversion, Float, Int, Tensor, TensorKind};
-
-type Backend = Autodiff<Fusion<Wgpu>>;
-type WgpuTensor<const D: usize = 2, K = Float> = Tensor<Backend, D, K>;
-
-const BATCH_SIZE: usize = 512;
-const DEVICE: WgpuDevice = WgpuDevice::BestAvailable;
-
-const NUM_INPUTS: usize = 28 * 28;
-const NUM_OUTPUTS: usize = 10;
+use burn::module::Module;
+use burn::nn::loss::CrossEntropyLossConfig;
+use burn::nn::{Linear, LinearConfig};
+use burn::optim::SgdConfig;
+use burn::record::CompactRecorder;
+use burn::record::Recorder;
+use burn::tensor::backend::{AutodiffBackend, Backend};
+use burn::tensor::{Data, ElementConversion, Int, Tensor, TensorKind};
+use burn::train::metric::{AccuracyMetric, LossMetric};
+use burn::train::LearnerBuilder;
+use burn::train::{ClassificationOutput, TrainOutput, TrainStep, ValidStep};
 
 fn main() {
-    let mut w = WgpuTensor::random(
-        [NUM_INPUTS, NUM_OUTPUTS],
-        Distribution::Normal(0.0, 0.01),
-        &DEVICE,
-    )
-    .require_grad();
-    let mut b = WgpuTensor::zeros([1, NUM_OUTPUTS], &DEVICE).require_grad();
-    let lr = 0.03;
-
-    let dataloader_train = DataLoaderBuilder::new(MyBatcher)
-        .batch_size(BATCH_SIZE)
-        .build(MNISTDataset::train());
-
-    for (counter, Batch { images, targets }) in dataloader_train.iter().enumerate() {
-        let x = images;
-        let y = targets;
-
-        let y_hat = net(x.tclone(), w.tclone(), b.tclone());
-        let l = cross_entropy(y.tclone(), y_hat.tclone());
-        let grad = l.mean().backward();
-
-        sdg([&mut w, &mut b], grad, lr);
-        println!("第[{}\t]次的准确度：{:.8}", counter + 1, accuracy(y, y_hat));
-    }
-
-    {
-        let Batch { images, targets } =
-            MyBatcher.batch(MNISTDataset::test().iter().collect::<Vec<_>>());
-        println!(
-            "最终准确度：{:.8}",
-            accuracy(targets, net(images, w.tclone(), b.tclone()))
-        )
-    }
-}
-
-fn softmax(x: WgpuTensor) -> WgpuTensor {
-    let x_exp = x.tclone().exp();
-    let partition = x_exp.tclone().sum_dim(1);
-    x_exp.tclone() / partition
-}
-
-/// y : [num_inputs,1]
-///
-/// y_hat : [num_inputs,num_outputs]
-fn cross_entropy(y: WgpuTensor<2, Int>, y_hat: WgpuTensor) -> WgpuTensor {
-    let tensors = y
-        .iter_dim(0)
-        .zip(y_hat.iter_dim(0))
-        .map(|(y, y_hat)| {
-            let index = y.into_scalar() as usize;
-            y_hat.slice([0..1, index..index + 1])
-        })
-        .collect();
-    -WgpuTensor::cat(tensors, 0).log()
-}
-
-fn sdg<const C: usize>(params: [&mut WgpuTensor; C], mut grad: Gradients, lr: f64) {
-    for param in params {
-        let grad = param.grad_remove(&mut grad).unwrap();
-        let delta_param = WgpuTensor::from_data(grad.into_data(), &DEVICE) * lr / 8;
-
-        *param = param
-            .tclone()
-            .set_require_grad(false)
-            .sub(delta_param)
-            .require_grad();
-    }
-}
-
-fn accuracy(y: WgpuTensor<2, Int>, y_hat: WgpuTensor) -> f32 {
-    let y_hat = y_hat.argmax(1);
-    y.tclone().equal(y_hat).float().sum().into_scalar() / y.dims()[0] as f32
-}
-
-fn net(x: WgpuTensor<3>, w: WgpuTensor, b: WgpuTensor) -> WgpuTensor {
-    softmax(x.reshape([-1, NUM_INPUTS as i32]).matmul(w) + b)
+    let artifact_dir = "./train";
+    let device = WgpuDevice::BestAvailable;
+    let config = Config::load(format!("{artifact_dir}/config.json")).unwrap_or_else(|_e| {
+        std::fs::create_dir(artifact_dir).ok();
+        let config = TrainingConfig::new(ModelConfig::new(), SgdConfig::new());
+        config
+            .save(format!("{artifact_dir}/config.json"))
+            .expect("???");
+        config
+    });
+    train::<Autodiff<Fusion<Wgpu>>>("./train", config, &device);
 }
 
 trait TensorClone
@@ -101,7 +36,7 @@ where
     fn tclone(&self) -> Self;
 }
 
-impl<B, const D: usize, K> TensorClone for Tensor<B, D, K>
+impl<B: Backend, const D: usize, K> TensorClone for Tensor<B, D, K>
 where
     B: burn::tensor::backend::Backend,
     K: TensorKind<B>,
@@ -112,33 +47,165 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct MyBatcher;
-
-#[derive(Debug, Clone)]
-struct Batch {
-    pub images: WgpuTensor<3>,
-    pub targets: WgpuTensor<2, Int>,
+#[derive(Debug, Clone, Copy, Default)]
+struct MNISTBatcher<B: Backend> {
+    device: B::Device,
 }
 
-impl Batcher<MNISTItem, Batch> for MyBatcher {
-    fn batch(&self, items: Vec<MNISTItem>) -> Batch {
+impl<B: Backend> MNISTBatcher<B> {
+    fn new(device: B::Device) -> Self {
+        Self { device }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MNISTBatch<B: Backend> {
+    pub images: Tensor<B, 3>,
+    pub targets: Tensor<B, 1, Int>,
+}
+
+impl<B: Backend> Batcher<MNISTItem, MNISTBatch<B>> for MNISTBatcher<B> {
+    fn batch(&self, items: Vec<MNISTItem>) -> MNISTBatch<B> {
         let images = items
             .iter()
             .map(|data| Data::<f32, 2>::from(data.image).convert())
-            .map(|data| WgpuTensor::<2>::from_data(data, &DEVICE))
+            .map(|data| Tensor::<B, 2>::from_data(data, &self.device))
             .map(|tensor| ((tensor.reshape([1, 28, 28]) / 255) - 0.1307) / 0.3081)
             .collect::<Vec<_>>();
         let targets = items
             .iter()
             .map(|target| {
-                WgpuTensor::<1, Int>::from_data(Data::from([(target.label as i64).elem()]), &DEVICE)
-                    .reshape([1, 1])
+                Tensor::<B, 1, Int>::from_data(
+                    Data::from([(target.label as i64).elem()]),
+                    &self.device,
+                )
             })
             .collect::<Vec<_>>();
-        Batch {
-            images: WgpuTensor::cat(images, 0),
-            targets: WgpuTensor::cat(targets, 0),
+        MNISTBatch {
+            images: Tensor::cat(images, 0),
+            targets: Tensor::cat(targets, 0),
         }
     }
+}
+
+#[derive(Module, Debug)]
+struct Model<B: Backend> {
+    linear1: Linear<B>,
+    linear2: Linear<B>,
+}
+
+impl<B: Backend> Model<B> {
+    pub fn forward(&self, images: Tensor<B, 3>) -> Tensor<B, 2> {
+        let [batch_size, width, height] = images.dims();
+        let images = images.reshape([batch_size, width * height]);
+
+        let x = self.linear1.forward(images);
+        self.linear2.forward(x)
+    }
+    pub fn forward_classification(
+        &self,
+        images: Tensor<B, 3>,
+        targets: Tensor<B, 1, Int>,
+    ) -> ClassificationOutput<B> {
+        let output = self.forward(images);
+        let loss = CrossEntropyLossConfig::new()
+            .init(&output.device())
+            .forward(output.clone(), targets.clone());
+
+        ClassificationOutput::new(loss, output, targets)
+    }
+}
+
+impl<B: AutodiffBackend> TrainStep<MNISTBatch<B>, ClassificationOutput<B>> for Model<B> {
+    fn step(&self, batch: MNISTBatch<B>) -> burn::train::TrainOutput<ClassificationOutput<B>> {
+        let item = self.forward_classification(batch.images, batch.targets);
+        TrainOutput::new::<B, Model<B>>(self, item.loss.backward(), item)
+    }
+}
+
+impl<B: Backend> ValidStep<MNISTBatch<B>, ClassificationOutput<B>> for Model<B> {
+    fn step(&self, batch: MNISTBatch<B>) -> ClassificationOutput<B> {
+        self.forward_classification(batch.images, batch.targets)
+    }
+}
+
+#[derive(Config)]
+struct ModelConfig {
+    #[config(default = 784 /* 28 * 28 */)]
+    num_inputs: usize,
+    #[config(default = 10)]
+    num_classes: usize,
+    #[config(default = 16)]
+    hidden_size: usize,
+}
+
+impl ModelConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
+        Model {
+            linear1: LinearConfig::new(self.num_inputs, self.hidden_size).init(device),
+            linear2: LinearConfig::new(self.hidden_size, self.num_classes).init(device),
+        }
+    }
+
+    pub fn init_with<B: Backend>(&self, record: ModelRecord<B>) -> Model<B> {
+        Model {
+            linear1: LinearConfig::new(self.num_inputs, self.hidden_size).init_with(record.linear1),
+            linear2: LinearConfig::new(self.hidden_size, self.num_classes)
+                .init_with(record.linear2),
+        }
+    }
+}
+
+#[derive(Config)]
+struct TrainingConfig {
+    pub model: ModelConfig,
+    pub optimizer: SgdConfig,
+    #[config(default = 10)]
+    pub num_epochs: usize,
+    #[config(default = 500)]
+    pub batch_size: usize,
+    #[config(default = 8)]
+    pub num_workers: usize,
+    #[config(default = 42)]
+    pub seed: u64,
+    #[config(default = 1.0e-4)]
+    pub learning_rate: f64,
+}
+
+fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, device: &B::Device) {
+    B::seed(config.seed);
+
+    let batcher_train = MNISTBatcher::<B>::new(device.clone());
+    let batcher_valid = MNISTBatcher::<B::InnerBackend>::new(device.clone());
+
+    let dataloader_train = DataLoaderBuilder::new(batcher_train)
+        .batch_size(config.batch_size)
+        .shuffle(config.seed)
+        .num_workers(config.num_workers)
+        .build(MNISTDataset::train());
+    let dataloader_test = DataLoaderBuilder::new(batcher_valid)
+        .batch_size(config.batch_size)
+        .shuffle(config.seed)
+        .num_workers(config.num_workers)
+        .build(MNISTDataset::test());
+
+    let model = CompactRecorder::new()
+        .load(format!("{artifact_dir}/model").into(), device)
+        .map(|record| config.model.init_with::<B>(record))
+        .unwrap_or_else(|_e| config.model.init(device));
+
+    let model = LearnerBuilder::new("./train")
+        .metric_train_numeric(AccuracyMetric::new())
+        .metric_valid_numeric(AccuracyMetric::new())
+        .metric_train_numeric(LossMetric::new())
+        .metric_valid_numeric(LossMetric::new())
+        .with_file_checkpointer(CompactRecorder::new())
+        .devices(vec![device.clone()])
+        .num_epochs(config.num_epochs)
+        .build(model, config.optimizer.init(), config.learning_rate)
+        .fit(dataloader_train, dataloader_test);
+
+    model
+        .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
+        .unwrap();
 }
