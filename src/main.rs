@@ -1,23 +1,23 @@
-use burn::backend::{wgpu::WgpuDevice, Autodiff, Fusion, Wgpu};
+use burn::backend::{candle::CandleDevice, Autodiff, Candle};
 use burn::config::Config;
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataset::vision::{MNISTDataset, MNISTItem};
 use burn::module::Module;
 use burn::nn::loss::CrossEntropyLossConfig;
-use burn::nn::{Linear, LinearConfig};
+use burn::nn::{Linear, LinearConfig, ReLU};
 use burn::optim::SgdConfig;
 use burn::record::CompactRecorder;
 use burn::record::Recorder;
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::{Data, ElementConversion, Int, Tensor, TensorKind};
+use burn::tensor::{Data, ElementConversion, Int, Tensor};
 use burn::train::metric::{AccuracyMetric, LossMetric};
 use burn::train::LearnerBuilder;
 use burn::train::{ClassificationOutput, TrainOutput, TrainStep, ValidStep};
 
 fn main() {
     let artifact_dir = "./train";
-    let device = WgpuDevice::BestAvailable;
+    let device = CandleDevice::Cuda(0);
     let config = Config::load(format!("{artifact_dir}/config.json")).unwrap_or_else(|_e| {
         std::fs::create_dir(artifact_dir).ok();
         let config = TrainingConfig::new(ModelConfig::new(), SgdConfig::new());
@@ -26,25 +26,7 @@ fn main() {
             .expect("???");
         config
     });
-    train::<Autodiff<Fusion<Wgpu>>>("./train", config, &device);
-}
-
-trait TensorClone
-where
-    Self: Sized,
-{
-    fn tclone(&self) -> Self;
-}
-
-impl<B: Backend, const D: usize, K> TensorClone for Tensor<B, D, K>
-where
-    B: burn::tensor::backend::Backend,
-    K: TensorKind<B>,
-    Self: Sized,
-{
-    fn tclone(&self) -> Self {
-        <Self as Clone>::clone(self)
-    }
+    train::<Autodiff<Candle>>("./train", config, &device);
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -91,6 +73,7 @@ impl<B: Backend> Batcher<MNISTItem, MNISTBatch<B>> for MNISTBatcher<B> {
 #[derive(Module, Debug)]
 struct Model<B: Backend> {
     linear1: Linear<B>,
+    relu: ReLU,
     linear2: Linear<B>,
 }
 
@@ -100,6 +83,7 @@ impl<B: Backend> Model<B> {
         let images = images.reshape([batch_size, width * height]);
 
         let x = self.linear1.forward(images);
+        let x = self.relu.forward(x);
         self.linear2.forward(x)
     }
     pub fn forward_classification(
@@ -143,6 +127,7 @@ impl ModelConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         Model {
             linear1: LinearConfig::new(self.num_inputs, self.hidden_size).init(device),
+            relu: ReLU::new(),
             linear2: LinearConfig::new(self.hidden_size, self.num_classes).init(device),
         }
     }
@@ -150,6 +135,7 @@ impl ModelConfig {
     pub fn init_with<B: Backend>(&self, record: ModelRecord<B>) -> Model<B> {
         Model {
             linear1: LinearConfig::new(self.num_inputs, self.hidden_size).init_with(record.linear1),
+            relu: ReLU::new(),
             linear2: LinearConfig::new(self.hidden_size, self.num_classes)
                 .init_with(record.linear2),
         }
@@ -173,7 +159,7 @@ struct TrainingConfig {
 }
 
 fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, device: &B::Device) {
-    B::seed(config.seed);
+    // B::seed(config.seed);
 
     let batcher_train = MNISTBatcher::<B>::new(device.clone());
     let batcher_valid = MNISTBatcher::<B::InnerBackend>::new(device.clone());
